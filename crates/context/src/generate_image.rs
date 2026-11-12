@@ -8,6 +8,45 @@ use std::io::Write;
 
 pub const DEFAULT_MODEL: &str = "gpt-image-2.5-flare";
 
+/// Nano Banana Pro: the Gemini image model that renders UI text most legibly,
+/// which is what a comp needs. `IMPECCABLE_GEMINI_IMAGE_MODEL` or `--model`
+/// overrides it (for example `gemini-3.1-flash-image`, cheaper per image).
+pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3-pro-image";
+
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// The image API a real-mode run calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    OpenAi,
+    Gemini,
+}
+
+fn env_value(env: &Env, name: &str) -> Option<String> {
+    env.get(name).filter(|v| !v.trim().is_empty()).cloned()
+}
+
+/// Which backend real mode uses and the key it sends. `IMPECCABLE_IMAGE_PROVIDER`
+/// (`openai` or `gemini`) pins one; otherwise an OpenAI key wins, so an
+/// environment that had one keeps behaving as before, and a Gemini key is used
+/// when it is the only one. `Ok(None)` means no key at all. `context` calls this
+/// too, so IMAGE_GEN_AVAILABLE always names the backend this verb would use.
+pub fn resolve_backend(env: &Env) -> Result<Option<(Backend, String)>, String> {
+    let openai = env_value(env, "OPENAI_API_KEY");
+    let gemini = env_value(env, "GEMINI_API_KEY");
+    match env_value(env, "IMPECCABLE_IMAGE_PROVIDER").map(|p| p.trim().to_ascii_lowercase()).as_deref() {
+        None => Ok(openai.map(|k| (Backend::OpenAi, k)).or(gemini.map(|k| (Backend::Gemini, k)))),
+        Some("openai") => openai.map(|k| Some((Backend::OpenAi, k))).ok_or_else(|| "IMPECCABLE_IMAGE_PROVIDER is openai but OPENAI_API_KEY is not set".into()),
+        Some("gemini") => gemini.map(|k| Some((Backend::Gemini, k))).ok_or_else(|| "IMPECCABLE_IMAGE_PROVIDER is gemini but GEMINI_API_KEY is not set".into()),
+        Some(other) => Err(format!("IMPECCABLE_IMAGE_PROVIDER must be openai or gemini, not \"{other}\"")),
+    }
+}
+
+/// The Gemini model a run uses when `--model` is not given.
+pub fn gemini_model(env: &Env) -> String {
+    env_value(env, "IMPECCABLE_GEMINI_IMAGE_MODEL").map(|m| m.trim().to_string()).unwrap_or_else(|| GEMINI_DEFAULT_MODEL.into())
+}
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == &format!("--{}", name))?;
     let v = args.get(i + 1)?;
@@ -317,9 +356,308 @@ fn url_file_name(url: &str) -> String {
     if name.is_empty() { "ref".to_string() } else { name }
 }
 
+/// Reads one `--ref`: a URL is downloaded and its bytes' signature names the
+/// type, a path is read from disk and its extension names the type. On failure
+/// it prints why and returns the exit code; nothing has been generated yet.
+fn load_ref(io: &mut Io, cwd: &str, r: &str) -> Result<(Vec<u8>, &'static str, String), i32> {
+    // A URL ref (a catalog world's card image, say) is downloaded and
+    // attached like a file; nothing is written when one fails.
+    if is_url(r) {
+        return match fetch_image(r, REF_DOWNLOAD_TIMEOUT, 5) {
+            Ok((bytes, ty)) => Ok((bytes, ty, url_file_name(r))),
+            Err(reason) => {
+                io.err(&format!("generate-image: could not download --ref {}: {}; nothing was generated.\n", r, reason));
+                Err(1)
+            }
+        };
+    }
+    let bytes = match std::fs::read(jsp::resolve(cwd, &[r])) {
+        Ok(b) => b,
+        Err(e) => {
+            io.err(&format!("Error: {}\n", node_read_error(r, &e)));
+            return Err(1);
+        }
+    };
+    let ty = if r.ends_with(".png") {
+        "image/png"
+    } else if r.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+    Ok((bytes, ty, r.rsplit('/').next().unwrap_or(r).to_string()))
+}
+
+/// Best effort: writes the prompt into the image itself, as `embed-prompt` does.
+fn embed(io: &mut Io, out: &str, prompt: &str) -> bool {
+    // JS-PARITY: generate-image.mjs#676 reports whether the embed actually
+    // succeeded. The install-path-with-spaces half of #676 is a JS-only
+    // subprocess concern (fileURLToPath vs URL.pathname); the engine embeds
+    // in-process, so only the success tracking and message carry over here.
+    let mut sub_io = Io::captured("", io.cwd.clone(), io.env.clone()).0;
+    let embedded = crate::embed_prompt::run(&[out.to_string(), "--prompt".to_string(), prompt.to_string()], &mut sub_io) == 0;
+    if !embedded {
+        io.err("generate-image: failed to embed prompt in the image\n");
+    }
+    embedded
+}
+
+/// How long one Gemini generation may take, connect to last byte. Nano Banana
+/// Pro thinks before it draws, so this is generous; it exists so a stalled
+/// connection cannot hang the agent's shell forever.
+const GEMINI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The aspect ratios Gemini image models accept in `imageConfig.aspectRatio`.
+const GEMINI_ASPECTS: [(&str, f64); 10] = [
+    ("1:1", 1.0),
+    ("2:3", 2.0 / 3.0),
+    ("3:2", 3.0 / 2.0),
+    ("3:4", 3.0 / 4.0),
+    ("4:3", 4.0 / 3.0),
+    ("4:5", 4.0 / 5.0),
+    ("5:4", 5.0 / 4.0),
+    ("9:16", 9.0 / 16.0),
+    ("16:9", 16.0 / 9.0),
+    ("21:9", 21.0 / 9.0),
+];
+
+/// Gemini takes an aspect ratio rather than pixels: the supported ratio
+/// nearest the requested `--size` on a log scale (first listed wins a tie).
+fn nearest_aspect(w: usize, h: usize) -> &'static str {
+    let target = (w.max(1) as f64 / h.max(1) as f64).ln();
+    let distance = |ratio: f64| (ratio.ln() - target).abs();
+    GEMINI_ASPECTS.iter().min_by(|a, b| distance(a.1).total_cmp(&distance(b.1))).map(|a| a.0).unwrap_or("1:1")
+}
+
+/// `imageConfig.imageSize` for models that take it (Gemini 3 and later): the
+/// smallest tier whose long side covers the requested one, and at least 2K for
+/// `--quality high`, which plates ask for. Gemini 2.x image models reject the
+/// field, so they get none and draw at their fixed size.
+fn gemini_image_size(model: &str, w: usize, h: usize, quality: &str) -> Option<&'static str> {
+    if model.starts_with("gemini-2.") || model.starts_with("gemini-1.") {
+        return None;
+    }
+    let long = w.max(h);
+    Some(if long > 2048 {
+        "4K"
+    } else if long > 1024 || quality == "high" {
+        "2K"
+    } else {
+        "1K"
+    })
+}
+
+/// A model name that is safe to put in the request path.
+fn valid_model(model: &str) -> bool {
+    !model.is_empty() && model.len() <= 120 && model.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// The image a `generateContent` response carries: the last part that is not
+/// a thought (Nano Banana Pro may send interim "thought" images before the
+/// final one), else the last image of any kind. With none, the reason: a block
+/// reason, a finish reason other than STOP, and any text the model wrote
+/// instead of drawing.
+fn gemini_response_image(json: &Value) -> Result<Vec<u8>, String> {
+    let candidate = json.get("candidates").and_then(|c| c.get(0));
+    let parts: Vec<Value> = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let thought = |p: &Value| p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+    let image_of = |p: &Value| -> Option<String> {
+        let inline = p.get("inlineData").or_else(|| p.get("inline_data"))?;
+        inline.get("data")?.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    if let Some(data) = parts.iter().rev().filter(|p| !thought(p)).find_map(image_of).or_else(|| parts.iter().rev().find_map(image_of)) {
+        return Ok(base64_decode(&data));
+    }
+    let mut why = Vec::new();
+    if let Some(reason) = json.get("promptFeedback").and_then(|f| f.get("blockReason")).and_then(|r| r.as_str()) {
+        why.push(format!("the prompt was blocked ({reason})"));
+    }
+    if let Some(reason) = candidate.and_then(|c| c.get("finishReason")).and_then(|r| r.as_str()).filter(|r| *r != "STOP") {
+        why.push(format!("finish reason {reason}"));
+    }
+    let text = collapse_ws(&parts.iter().filter(|p| !thought(p)).filter_map(|p| p.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(" "));
+    if !text.is_empty() {
+        why.push(format!("the model answered in text: {}", text.chars().take(300).collect::<String>()));
+    }
+    Err(if why.is_empty() { "the response held no image".into() } else { why.join("; ") })
+}
+
+/// Width and height of an image's bytes: a PNG's header, else a full decode.
+fn image_dims(bytes: &[u8]) -> Option<(usize, usize)> {
+    if impeccable_comp::png_io::is_png(bytes) && bytes.len() >= 24 {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as usize;
+        return Some((w, h));
+    }
+    impeccable_comp::png_io::decode_source(bytes).ok().map(|img| (img.width, img.height))
+}
+
+struct GeminiJob<'a> {
+    prompt: &'a str,
+    out: &'a str,
+    size: &'a str,
+    quality: &'a str,
+    model: &'a str,
+    refs: &'a [String],
+    background: Option<&'a str>,
+}
+
+/// Real mode against the Gemini API: one `generateContent` call with the refs
+/// as inline images ahead of the prompt, the size expressed as an aspect ratio
+/// and an output tier. A `.png` out is always PNG on disk (a JPEG or WebP
+/// answer is converted), so `embed-prompt`, `comp-spec`, and the plates gate
+/// read it like an OpenAI image.
+fn run_gemini(io: &mut Io, key: &str, base: &str, job: &GeminiJob) -> i32 {
+    let cwd = io.cwd.to_string_lossy().into_owned();
+    let model = job.model.strip_prefix("models/").unwrap_or(job.model);
+    if !valid_model(model) {
+        io.err(&format!("generate-image: --model {:?} is not a Gemini model name.\n", job.model));
+        return 1;
+    }
+    let out_lower = job.out.to_ascii_lowercase();
+    let png_out = out_lower.ends_with(".png");
+    let wanted = if png_out {
+        "image/png"
+    } else if out_lower.ends_with(".jpg") || out_lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if out_lower.ends_with(".webp") {
+        "image/webp"
+    } else {
+        io.err("generate-image: the Gemini backend writes raster images; use a .png --out.\n");
+        return 1;
+    };
+    let (w, h) = parse_size(job.size);
+    let aspect = nearest_aspect(w, h);
+    let image_size = gemini_image_size(model, w, h, job.quality);
+    let mut parts: Vec<Value> = Vec::new();
+    for r in job.refs {
+        let (bytes, ty, _) = match load_ref(io, &cwd, r) {
+            Ok(loaded) => loaded,
+            Err(code) => return code,
+        };
+        let mime = sniffed_type(&bytes).unwrap_or(ty);
+        parts.push(serde_json::json!({ "inlineData": { "mimeType": mime, "data": base64_encode(&bytes) } }));
+    }
+    parts.push(serde_json::json!({ "text": job.prompt }));
+    let mut image_config = Map::new();
+    image_config.insert("aspectRatio".into(), Value::String(aspect.into()));
+    if let Some(tier) = image_size {
+        image_config.insert("imageSize".into(), Value::String(tier.into()));
+    }
+    let body = serde_json::json!({
+        "contents": [{ "role": "user", "parts": parts }],
+        "generationConfig": { "responseModalities": ["TEXT", "IMAGE"], "imageConfig": image_config },
+    });
+    let agent = crate::http::agent_builder(base).timeout(GEMINI_TIMEOUT).build();
+    let response = agent
+        .post(&format!("{base}/models/{model}:generateContent"))
+        .set("x-goog-api-key", key)
+        .set("content-type", "application/json")
+        .send_string(&body.to_string());
+    let (status, text) = match response {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+        Err(e) => {
+            io.err(&format!("generate-image: the Gemini request failed: {}\n", e));
+            return 1;
+        }
+    };
+    if !(200..300).contains(&status) {
+        let snippet: String = text.chars().take(300).collect();
+        let hint = match status {
+            404 => format!(" (no model {model} for this key: set IMPECCABLE_GEMINI_IMAGE_MODEL or pass --model with an image model the key can use)"),
+            429 => " (quota exhausted: image models may need a billing-enabled project, which Google AI plan credits can fund)".to_string(),
+            _ => String::new(),
+        };
+        io.err(&format!("generate-image: API error {}: {}{}\n", status, snippet, hint));
+        return 1;
+    }
+    let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let mut bytes = match gemini_response_image(&json) {
+        Ok(b) => b,
+        Err(reason) => {
+            io.err(&format!("generate-image: no image in response: {}\n", reason));
+            return 1;
+        }
+    };
+    let got = sniffed_type(&bytes);
+    if got != Some(wanted) {
+        if !png_out {
+            io.err(&format!("generate-image: Gemini returned {}, not what --out names; use a .png --out, which converts.\n", got.unwrap_or("an unrecognized format")));
+            return 1;
+        }
+        match impeccable_comp::png_io::decode_source(&bytes).and_then(|img| impeccable_comp::png_io::encode_png(&img, &[])) {
+            Ok(png) => bytes = png,
+            Err(e) => {
+                io.err(&format!("generate-image: the Gemini image could not be converted to PNG: {}\n", e));
+                return 1;
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(jsp::resolve(&cwd, &[job.out]), &bytes) {
+        io.err(&format!("Error: {}\n", node_read_error(job.out, &e)));
+        return 1;
+    }
+    let embedded = embed(io, job.out, job.prompt);
+    let mut m = Map::new();
+    m.insert("prompt".into(), Value::String(job.prompt.to_string()));
+    m.insert("createdAt".into(), Value::String(iso_now()));
+    m.insert("tool".into(), Value::String("impeccable generate-image".into()));
+    m.insert("provider".into(), Value::String("gemini".into()));
+    m.insert("model".into(), Value::String(model.to_string()));
+    m.insert("aspectRatio".into(), Value::String(aspect.into()));
+    if let Some(tier) = image_size {
+        m.insert("imageSize".into(), Value::String(tier.into()));
+    }
+    if let Some(background) = job.background {
+        m.insert("background".into(), Value::String(background.into()));
+    }
+    if !job.refs.is_empty() {
+        m.insert("refs".into(), Value::Array(job.refs.iter().cloned().map(Value::String).collect()));
+    }
+    let _ = std::fs::write(jsp::resolve(&cwd, &[&format!("{}.json", job.out)]), json_pretty(&Value::Object(m)));
+    note_generated_slot(io, job.out);
+    let dims = image_dims(&bytes).map(|(w, h)| format!("{w}x{h}")).unwrap_or_else(|| "size unknown".into());
+    let tier = image_size.map(|t| format!(" at {t}")).unwrap_or_default();
+    io.out(&format!(
+        "IMAGE: {} ({}, {}{}, {}, billed to your Gemini API key); {} at {}.json\n",
+        job.out,
+        dims,
+        aspect,
+        tier,
+        model,
+        if embedded { "prompt embedded + sidecar" } else { "sidecar" },
+        job.out
+    ));
+    0
+}
+
 pub fn run(args: &[String], io: &mut Io) -> i32 {
     let api_base = api_base(&io.env);
-    run_with_api_base(args, io, &api_base)
+    let gemini_base = gemini_api_base(&io.env);
+    run_with_bases(args, io, &api_base, &gemini_base)
+}
+
+/// The Gemini API base (`/v1beta` included) that `/models/<model>:generateContent`
+/// hangs off. `IMPECCABLE_GEMINI_BASE_URL` points it at a proxy or a test server.
+fn gemini_api_base(env: &Env) -> String {
+    env.get("IMPECCABLE_GEMINI_BASE_URL")
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| GEMINI_API_BASE.into())
 }
 
 /// OPENAI_BASE_URL is the variable the OpenAI SDKs read for a proxy or compatible endpoint, with
@@ -331,7 +669,13 @@ fn api_base(env: &Env) -> String {
         .unwrap_or_else(|| "https://api.openai.com/v1".into())
 }
 
+#[cfg(test)]
 fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
+    let gemini_base = gemini_api_base(&io.env);
+    run_with_bases(args, io, api_base, &gemini_base)
+}
+
+fn run_with_bases(args: &[String], io: &mut Io, api_base: &str, gemini_base: &str) -> i32 {
     let background = arg(args, "background");
     if args.iter().any(|a| a == "--background") && !matches!(background.as_deref(), Some("transparent" | "opaque" | "auto")) {
         io.err("generate-image: --background must be transparent, opaque, or auto.\n");
@@ -383,10 +727,24 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
         note_generated_slot(io, &out);
         return 0;
     }
-    let Some(key) = env.get("OPENAI_API_KEY").filter(|k| !k.is_empty()).cloned() else {
-        io.err("generate-image: OPENAI_API_KEY is not set; use the harness-native image tool instead.\n");
-        return 1;
+    let (backend, key) = match resolve_backend(&env) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            io.err("generate-image: no image API key is set (OPENAI_API_KEY or GEMINI_API_KEY); use the harness-native image tool instead.\n");
+            return 1;
+        }
+        Err(reason) => {
+            io.err(&format!("generate-image: {reason}.\n"));
+            return 1;
+        }
     };
+    // Gemini image models have no alpha output. Keying out a painted ground
+    // leaves halos on exactly the edges a cutout exists for, so refuse before
+    // spending a request rather than ship a fake transparency.
+    if backend == Backend::Gemini && transparent {
+        io.err("generate-image: Gemini image models return opaque pixels, so --background transparent cannot be honored; report the transparency blocker, or generate an opaque plate with --background opaque.\n");
+        return 1;
+    }
     let prompt = match arg(args, "prompt-file") {
         Some(pf) => match read_prompt_file(io, &pf) {
             Ok(p) => Some(p),
@@ -401,7 +759,6 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
     };
     let size = arg(args, "size").unwrap_or_else(|| "1536x1024".into());
     let quality = arg(args, "quality").unwrap_or_else(|| "medium".into());
-    let model = arg(args, "model").unwrap_or_else(|| DEFAULT_MODEL.into());
     let mut refs: Vec<String> = Vec::new();
     for i in 0..args.len() {
         if args[i] == "--ref" {
@@ -412,6 +769,12 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
             }
         }
     }
+    if backend == Backend::Gemini {
+        let model = arg(args, "model").unwrap_or_else(|| gemini_model(&env));
+        let job = GeminiJob { prompt: &prompt, out: &out, size: &size, quality: &quality, model: &model, refs: &refs, background: background.as_deref() };
+        return run_gemini(io, &key, gemini_base, &job);
+    }
+    let model = arg(args, "model").unwrap_or_else(|| DEFAULT_MODEL.into());
     let agent = crate::http::agent_builder(api_base).build();
     let response = if !refs.is_empty() {
         let boundary = format!("----impeccable{:x}", crate::util::now_ms() as u64);
@@ -429,32 +792,9 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
             field("output_format", "png");
         }
         for r in &refs {
-            // A URL ref (a catalog world's card image, say) is downloaded
-            // and attached like a file; nothing is written when one fails.
-            let (bytes, ty, filename) = if is_url(r) {
-                match fetch_image(r, REF_DOWNLOAD_TIMEOUT, 5) {
-                    Ok((bytes, ty)) => (bytes, ty, url_file_name(r)),
-                    Err(reason) => {
-                        io.err(&format!("generate-image: could not download --ref {}: {}; nothing was generated.\n", r, reason));
-                        return 1;
-                    }
-                }
-            } else {
-                let bytes = match std::fs::read(abs(r)) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        io.err(&format!("Error: {}\n", node_read_error(r, &e)));
-                        return 1;
-                    }
-                };
-                let ty = if r.ends_with(".png") {
-                    "image/png"
-                } else if r.ends_with(".webp") {
-                    "image/webp"
-                } else {
-                    "image/jpeg"
-                };
-                (bytes, ty, r.rsplit('/').next().unwrap_or(r).to_string())
+            let (bytes, ty, filename) = match load_ref(io, &cwd, r) {
+                Ok(loaded) => loaded,
+                Err(code) => return code,
             };
             body.extend_from_slice(
                 format!("--{}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", boundary, filename, ty).as_bytes(),
@@ -510,18 +850,8 @@ fn run_with_api_base(args: &[String], io: &mut Io, api_base: &str) -> i32 {
     let bytes = base64_decode(b64);
     let _ = std::fs::write(abs(&out), bytes);
     // best-effort embed + sidecar
-    // JS-PARITY: generate-image.mjs#676 reports whether the embed actually
-    // succeeded. The install-path-with-spaces half of #676 is a JS-only
-    // subprocess concern (fileURLToPath vs URL.pathname); the engine embeds
-    // in-process, so only the success tracking and message carry over here.
-    let embedded;
+    let embedded = embed(io, &out, &prompt);
     {
-        let mut sub_io = Io::captured("", io.cwd.clone(), io.env.clone()).0;
-        let ret = crate::embed_prompt::run(&[out.clone(), "--prompt".to_string(), prompt.clone()], &mut sub_io);
-        embedded = ret == 0;
-        if !embedded {
-            io.err("generate-image: failed to embed prompt in the image\n");
-        }
         let mut m = Map::new();
         m.insert("prompt".into(), Value::String(prompt.clone()));
         m.insert("createdAt".into(), Value::String(iso_now()));
@@ -879,6 +1209,225 @@ mod tests {
         assert_eq!(api_base(&env("  ")), "https://api.openai.com/v1");
         assert_eq!(api_base(&env("http://127.0.0.1:8790/openai/v1/")), "http://127.0.0.1:8790/openai/v1");
         assert_eq!(api_base(&env("https://proxy.example/v1")), "https://proxy.example/v1");
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> Env {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// A `generateContent` answer whose parts are `parts`, ending in STOP.
+    fn gemini_answer(parts: Value) -> String {
+        serde_json::json!({ "candidates": [{ "content": { "role": "model", "parts": parts }, "finishReason": "STOP" }] }).to_string()
+    }
+
+    /// Answers one request with `status` and `body`; returns what it saw as
+    /// (path, x-goog-api-key, body).
+    fn serve_once(server: tiny_http::Server, status: u16, body: String) -> std::thread::JoinHandle<(String, String, Vec<u8>)> {
+        std::thread::spawn(move || {
+            let mut request = server.recv_timeout(Duration::from_secs(10)).unwrap().expect("gemini request");
+            let path = request.url().to_string();
+            let key = request.headers().iter().find(|h| h.field.equiv("x-goog-api-key")).map(|h| h.value.to_string()).unwrap_or_default();
+            let mut bytes = Vec::new();
+            request.as_reader().read_to_end(&mut bytes).unwrap();
+            let response = tiny_http::Response::from_string(body)
+                .with_status_code(status)
+                .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+            request.respond(response).unwrap();
+            (path, key, bytes)
+        })
+    }
+
+    fn run_gemini_args(dir: &std::path::Path, env: Env, base: &str, args: &[&str]) -> (i32, String, String) {
+        let (mut io, captured) = Io::captured("", dir.to_path_buf(), env);
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let exit = run_with_bases(&args, &mut io, "http://127.0.0.1:9/openai-must-not-be-called", base);
+        let out = String::from_utf8(captured.stdout.borrow().clone()).unwrap();
+        let err = String::from_utf8(captured.stderr.borrow().clone()).unwrap();
+        (exit, out, err)
+    }
+
+    #[test]
+    fn backend_resolution_keeps_openai_first_and_honors_a_pin() {
+        let pick = |pairs: &[(&str, &str)]| resolve_backend(&env_of(pairs)).map(|o| o.map(|(b, k)| (b, k)));
+        assert_eq!(pick(&[]), Ok(None));
+        assert_eq!(pick(&[("OPENAI_API_KEY", "  ")]), Ok(None));
+        assert_eq!(pick(&[("OPENAI_API_KEY", "sk")]), Ok(Some((Backend::OpenAi, "sk".into()))));
+        assert_eq!(pick(&[("GEMINI_API_KEY", "g")]), Ok(Some((Backend::Gemini, "g".into()))));
+        // Both keys: OpenAI, as before this backend existed, unless pinned.
+        assert_eq!(pick(&[("OPENAI_API_KEY", "sk"), ("GEMINI_API_KEY", "g")]), Ok(Some((Backend::OpenAi, "sk".into()))));
+        assert_eq!(pick(&[("OPENAI_API_KEY", "sk"), ("GEMINI_API_KEY", "g"), ("IMPECCABLE_IMAGE_PROVIDER", " Gemini ")]), Ok(Some((Backend::Gemini, "g".into()))));
+        assert_eq!(pick(&[("GEMINI_API_KEY", "g"), ("IMPECCABLE_IMAGE_PROVIDER", "openai")]), Err("IMPECCABLE_IMAGE_PROVIDER is openai but OPENAI_API_KEY is not set".into()));
+        assert_eq!(pick(&[("OPENAI_API_KEY", "sk"), ("IMPECCABLE_IMAGE_PROVIDER", "gemini")]), Err("IMPECCABLE_IMAGE_PROVIDER is gemini but GEMINI_API_KEY is not set".into()));
+        assert_eq!(pick(&[("GEMINI_API_KEY", "g"), ("IMPECCABLE_IMAGE_PROVIDER", "imagen")]), Err("IMPECCABLE_IMAGE_PROVIDER must be openai or gemini, not \"imagen\"".into()));
+        assert_eq!(gemini_model(&Env::new()), GEMINI_DEFAULT_MODEL);
+        assert_eq!(gemini_model(&env_of(&[("IMPECCABLE_GEMINI_IMAGE_MODEL", " gemini-3.1-flash-image ")])), "gemini-3.1-flash-image");
+    }
+
+    #[test]
+    fn no_key_names_both_keys() {
+        let dir = temp("gemini-no-key");
+        let (exit, out, err) = run_gemini_args(&dir, Env::new(), "http://127.0.0.1:9", &["--prompt", "p", "--out", "x.png"]);
+        assert_eq!((exit, out.as_str()), (1, ""));
+        assert_eq!(err, "generate-image: no image API key is set (OPENAI_API_KEY or GEMINI_API_KEY); use the harness-native image tool instead.\n");
+        let (exit, _, err) = run_gemini_args(&dir, env_of(&[("GEMINI_API_KEY", "g"), ("IMPECCABLE_IMAGE_PROVIDER", "dall-e")]), "http://127.0.0.1:9", &["--prompt", "p", "--out", "x.png"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: IMPECCABLE_IMAGE_PROVIDER must be openai or gemini, not \"dall-e\".\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn aspect_and_tier_follow_the_requested_size() {
+        assert_eq!(nearest_aspect(1536, 1024), "3:2");
+        assert_eq!(nearest_aspect(1024, 1536), "2:3");
+        assert_eq!(nearest_aspect(1024, 1024), "1:1");
+        assert_eq!(nearest_aspect(1920, 1080), "16:9");
+        assert_eq!(nearest_aspect(1440, 900), "3:2");
+        assert_eq!(nearest_aspect(390, 844), "9:16");
+        assert_eq!(nearest_aspect(2520, 1080), "21:9");
+        assert_eq!(nearest_aspect(5000, 100), "21:9");
+        assert_eq!(nearest_aspect(0, 0), "1:1");
+        assert_eq!(gemini_image_size("gemini-3-pro-image", 1536, 1024, "medium"), Some("2K"));
+        assert_eq!(gemini_image_size("gemini-3-pro-image", 800, 600, "medium"), Some("1K"));
+        assert_eq!(gemini_image_size("gemini-3-pro-image", 800, 600, "high"), Some("2K"));
+        assert_eq!(gemini_image_size("gemini-3.1-flash-image", 3000, 2000, "medium"), Some("4K"));
+        assert_eq!(gemini_image_size("gemini-2.5-flash-image", 3000, 2000, "high"), None);
+    }
+
+    #[test]
+    fn base64_encode_round_trips() {
+        for len in 0..10 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 250) as u8).collect();
+            assert_eq!(base64_decode(&base64_encode(&bytes)), bytes);
+        }
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn gemini_generation_sends_refs_inline_and_keeps_the_final_image() {
+        let _proxy_lock = crate::http::PROXY_ENV_LOCK.lock().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1beta", server.server_addr());
+        let dir = temp("gemini-round-trip");
+        let reference = png_fake("reference", 8, 8);
+        std::fs::write(dir.join("ref.png"), &reference).unwrap();
+        let (thought, last) = (png_fake("interim thought", 4, 4), png_fake("final comp", 6, 4));
+        let answer = gemini_answer(serde_json::json!([
+            { "text": "Planning the layout.", "thought": true },
+            { "inlineData": { "mimeType": "image/png", "data": base64_encode(&thought) }, "thought": true },
+            { "text": "Here is the comp." },
+            { "inlineData": { "mimeType": "image/png", "data": base64_encode(&last) } },
+        ]));
+        let handle = serve_once(server, 200, answer);
+        let env = env_of(&[("GEMINI_API_KEY", "gm-key")]);
+        let (exit, out, err) = run_gemini_args(&dir, env, &base, &["--prompt", "A booking dashboard comp.", "--out", "comp.png", "--ref", "ref.png", "--quality", "high"]);
+        let (path, key, body) = handle.join().unwrap();
+        assert_eq!(exit, 0, "{err}");
+        assert_eq!(path, "/v1beta/models/gemini-3-pro-image:generateContent");
+        assert_eq!(key, "gm-key");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "contents": [{ "role": "user", "parts": [
+                    { "inlineData": { "mimeType": "image/png", "data": base64_encode(&reference) } },
+                    { "text": "A booking dashboard comp." },
+                ]}],
+                "generationConfig": { "responseModalities": ["TEXT", "IMAGE"], "imageConfig": { "aspectRatio": "3:2", "imageSize": "2K" } },
+            })
+        );
+        // The final image, not the thought, with the prompt embedded before IEND.
+        let image = std::fs::read(dir.join("comp.png")).unwrap();
+        assert!(image.starts_with(&last[..last.len() - 12]));
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(dir.join("comp.png.json")).unwrap()).unwrap();
+        assert_eq!(sidecar["provider"], "gemini");
+        assert_eq!(sidecar["model"], "gemini-3-pro-image");
+        assert_eq!(sidecar["aspectRatio"], "3:2");
+        assert_eq!(sidecar["imageSize"], "2K");
+        assert_eq!(sidecar["refs"], serde_json::json!(["ref.png"]));
+        assert_eq!(sidecar["prompt"], "A booking dashboard comp.");
+        assert_eq!(out, "IMAGE: comp.png (6x4, 3:2 at 2K, gemini-3-pro-image, billed to your Gemini API key); prompt embedded + sidecar at comp.png.json\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gemini_jpeg_answer_becomes_a_png_and_model_comes_from_env() {
+        let _proxy_lock = crate::http::PROXY_ENV_LOCK.lock().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let dir = temp("gemini-jpeg");
+        let mut jpeg = Vec::new();
+        image::RgbImage::from_pixel(10, 6, image::Rgb([200, 80, 40])).write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
+        let handle = serve_once(server, 200, gemini_answer(serde_json::json!([{ "inline_data": { "mime_type": "image/jpeg", "data": base64_encode(&jpeg) } }])));
+        let env = env_of(&[("GEMINI_API_KEY", "g"), ("IMPECCABLE_GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")]);
+        let (exit, out, err) = run_gemini_args(&dir, env, &base, &["--prompt", "p", "--out", "plate.png", "--size", "1024x1536", "--background", "opaque"]);
+        let (path, _, body) = handle.join().unwrap();
+        assert_eq!(exit, 0, "{err}");
+        assert_eq!(path, "/models/gemini-2.5-flash-image:generateContent");
+        // Gemini 2.x takes no imageSize.
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["generationConfig"]["imageConfig"], serde_json::json!({ "aspectRatio": "2:3" }));
+        let png = std::fs::read(dir.join("plate.png")).unwrap();
+        assert!(impeccable_comp::png_io::is_png(&png));
+        assert_eq!(image_dims(&png), Some((10, 6)));
+        let sidecar: Value = serde_json::from_slice(&std::fs::read(dir.join("plate.png.json")).unwrap()).unwrap();
+        assert_eq!(sidecar["background"], "opaque");
+        assert!(sidecar.get("imageSize").is_none());
+        assert_eq!(out, "IMAGE: plate.png (10x6, 2:3, gemini-2.5-flash-image, billed to your Gemini API key); prompt embedded + sidecar at plate.png.json\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gemini_refuses_what_it_cannot_honor_before_any_request() {
+        // Nothing listens at the base: any request would fail differently.
+        let dir = temp("gemini-refusals");
+        let env = || env_of(&[("GEMINI_API_KEY", "g")]);
+        let (exit, out, err) = run_gemini_args(&dir, env(), "http://127.0.0.1:9", &["--prompt", "p", "--out", "cutout.png", "--background", "transparent"]);
+        assert_eq!((exit, out.as_str()), (1, ""));
+        assert_eq!(err, "generate-image: Gemini image models return opaque pixels, so --background transparent cannot be honored; report the transparency blocker, or generate an opaque plate with --background opaque.\n");
+        let (exit, _, err) = run_gemini_args(&dir, env(), "http://127.0.0.1:9", &["--prompt", "p", "--out", "comp.svg"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: the Gemini backend writes raster images; use a .png --out.\n");
+        let (exit, _, err) = run_gemini_args(&dir, env(), "http://127.0.0.1:9", &["--prompt", "p", "--out", "comp.png", "--model", "../../files"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: --model \"../../files\" is not a Gemini model name.\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gemini_failures_say_why_and_write_nothing() {
+        let _proxy_lock = crate::http::PROXY_ENV_LOCK.lock().unwrap();
+        let dir = temp("gemini-failures");
+        let attempt = |status: u16, body: String, args: &[&str]| {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", server.server_addr());
+            let handle = serve_once(server, status, body);
+            let result = run_gemini_args(&dir, env_of(&[("GEMINI_API_KEY", "g")]), &base, args);
+            handle.join().unwrap();
+            result
+        };
+        let refusal = serde_json::json!({ "candidates": [{ "content": { "parts": [{ "text": "I can't draw that,\n  but here is a description." }] }, "finishReason": "IMAGE_SAFETY" }] }).to_string();
+        let (exit, _, err) = attempt(200, refusal, &["--prompt", "p", "--out", "comp.png"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: no image in response: finish reason IMAGE_SAFETY; the model answered in text: I can't draw that, but here is a description.\n");
+        let blocked = serde_json::json!({ "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" } }).to_string();
+        let (_, _, err) = attempt(200, blocked, &["--prompt", "p", "--out", "comp.png"]);
+        assert_eq!(err, "generate-image: no image in response: the prompt was blocked (PROHIBITED_CONTENT)\n");
+        let (exit, _, err) = attempt(404, r#"{"error":{"code":404}}"#.into(), &["--prompt", "p", "--out", "comp.png", "--model", "models/gemini-9-image"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: API error 404: {\"error\":{\"code\":404}} (no model gemini-9-image for this key: set IMPECCABLE_GEMINI_IMAGE_MODEL or pass --model with an image model the key can use)\n");
+        let (_, _, err) = attempt(429, "{}".into(), &["--prompt", "p", "--out", "comp.png"]);
+        assert!(err.ends_with("(quota exhausted: image models may need a billing-enabled project, which Google AI plan credits can fund)\n"), "{err}");
+        // A PNG answer cannot be written as a JPEG out.
+        let png = gemini_answer(serde_json::json!([{ "inlineData": { "mimeType": "image/png", "data": base64_encode(&png_fake("x", 4, 4)) } }]));
+        let (exit, _, err) = attempt(200, png, &["--prompt", "p", "--out", "comp.jpg"]);
+        assert_eq!(exit, 1);
+        assert_eq!(err, "generate-image: Gemini returned image/png, not what --out names; use a .png --out, which converts.\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

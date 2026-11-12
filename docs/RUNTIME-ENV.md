@@ -13,6 +13,16 @@ skill's `reference/` and `SKILL.md` live (`../reference`, `../SKILL.md`).
 | `IMPECCABLE_SEED_SALT` | Pins the salt seed references are computed under (`impeccable_common::seed`), so tests and the oracle print stable references. Never set it in normal use: the per-user salt is what keeps a committed reference from being computed out of a key. | The contents of `~/.impeccable/seed-salt`, 128 random bits created on first use. |
 | `IMPECCABLE_TELEMETRY_CHANNEL` | A lowercase word appended to `X-Impeccable-Client` (`test` in this repo's tests and CI) so test traffic is tagged. | None. |
 
+Image generation (`generate-image`, and the `context` directive that announces it; fork addition, full contract under `generate-image` in `docs/CLI-CONTRACT.md`):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `OPENAI_API_KEY` | Key for the OpenAI image backend. `OPENAI_BASE_URL` points it at a proxy. | unset |
+| `GEMINI_API_KEY` | Key for the Gemini image backend (a Google AI Studio key). Used when no OpenAI key is set, or when pinned. | unset |
+| `IMPECCABLE_IMAGE_PROVIDER` | `openai` or `gemini`: pins the backend when both keys exist. | OpenAI if its key is set, else Gemini |
+| `IMPECCABLE_GEMINI_IMAGE_MODEL` | The Gemini image model when `--model` is not given. | `gemini-3-pro-image` |
+| `IMPECCABLE_GEMINI_BASE_URL` | The Gemini API base, `/v1beta` included, for a proxy or a test server. | `https://generativelanguage.googleapis.com/v1beta` |
+
 Everything else is the JS contract's own environment (`IMPECCABLE_CONTEXT_DIR`,
 `IMPECCABLE_UPDATE_*`, `IMPECCABLE_STALENESS_CACHE`, `IMPECCABLE_CATALOG_DIR`,
 `IMPECCABLE_API_URL`, `IMPECCABLE_IMAGE_GEN_FAKE`, ...), read unchanged.

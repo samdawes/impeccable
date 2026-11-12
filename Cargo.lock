@@ -646,6 +646,7 @@ name = "impeccable-context"
 version = "0.1.22"
 dependencies = [
  "flate2",
+ "image",
  "impeccable-common",
  "impeccable-comp",
  "impeccable-core",

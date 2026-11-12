@@ -236,15 +236,29 @@ fn append_build_path_directive(parts: &mut Parts, ctx: &Ctx, cwd: &str) {
 }
 
 fn append_image_gen_directive(parts: &mut Parts, env: &Env, provider: &Provider) {
-    if !env.get("OPENAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+    use crate::generate_image::{gemini_model, resolve_backend, Backend, DEFAULT_MODEL};
+    // The same resolution `generate-image` runs, so the directive never names
+    // a backend the verb would not use. A bad IMPECCABLE_IMAGE_PROVIDER prints
+    // nothing here; the verb itself says what is wrong with it.
+    let Ok(Some((backend, _))) = resolve_backend(env) else {
         return;
-    }
-    parts.push([
-        "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
-        "This environment also carries an OpenAI key as the fallback for harnesses with no native tool:".to_string(),
-        format!("`{} --prompt \"...\" --out <file>` ({}, billed to the user's key; say so before the first render, and never reach for it when a native tool exists).", provider.verb_cmd("generate-image"), crate::generate_image::DEFAULT_MODEL),
-        "Visualizing a direction before building it measurably strengthens the result.".to_string(),
-    ].join(" "));
+    };
+    let cmd = provider.verb_cmd("generate-image");
+    let line = match backend {
+        Backend::OpenAi => [
+            "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
+            "This environment also carries an OpenAI key as the fallback for harnesses with no native tool:".to_string(),
+            format!("`{} --prompt \"...\" --out <file>` ({}, billed to the user's key; say so before the first render, and never reach for it when a native tool exists).", cmd, DEFAULT_MODEL),
+            "Visualizing a direction before building it measurably strengthens the result.".to_string(),
+        ],
+        Backend::Gemini => [
+            "IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice for generation; use it whenever one exists.".to_string(),
+            "This environment also carries a Gemini API key as the fallback for harnesses with no native tool:".to_string(),
+            format!("`{} --prompt \"...\" --out <file>` ({}, billed to the user's Gemini API key; say so before the first render, and never reach for it when a native tool exists). Gemini images are always opaque, so this fallback refuses `--background transparent`: for a cutout plate, report the transparency blocker rather than keying out a painted ground.", cmd, gemini_model(env)),
+            "Visualizing a direction before building it measurably strengthens the result.".to_string(),
+        ],
+    };
+    parts.push(line.join(" "));
 }
 
 fn append_autonomy_counter_directive(parts: &mut Parts) {
@@ -1013,6 +1027,35 @@ mod skill_version_tests {
         assert_eq!(v("---  \nversion: 4.1.3\n---  \n").as_deref(), Some("4.1.3"));
         assert_eq!(v("version: 4.1.3\n"), None);
         assert_eq!(v("---\nversion:\n---\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod image_gen_directive_tests {
+    use super::*;
+
+    fn directive(pairs: &[(&str, &str)]) -> String {
+        let mut env: Env = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        env.insert("IMPECCABLE_SELF".into(), "impeccable".into());
+        let provider = crate::provider::detect(&env, "/project");
+        let mut parts = Parts::default();
+        append_image_gen_directive(&mut parts, &env, &provider);
+        parts.render().trim().to_string()
+    }
+
+    #[test]
+    fn names_the_backend_generate_image_would_use() {
+        assert_eq!(directive(&[]), "");
+        assert_eq!(directive(&[("IMPECCABLE_IMAGE_PROVIDER", "nope"), ("GEMINI_API_KEY", "g")]), "");
+        let openai = directive(&[("OPENAI_API_KEY", "sk"), ("GEMINI_API_KEY", "g")]);
+        assert!(openai.contains("carries an OpenAI key as the fallback") && openai.contains("gpt-image-2.5-flare, billed to the user's key;"), "{openai}");
+        let gemini = directive(&[("GEMINI_API_KEY", "g")]);
+        assert!(gemini.starts_with("IMAGE_GEN_AVAILABLE: your harness-native image tool is always the first choice"), "{gemini}");
+        assert!(gemini.contains("carries a Gemini API key as the fallback for harnesses with no native tool: `impeccable generate-image --prompt \"...\" --out <file>` (gemini-3-pro-image, billed to the user's Gemini API key;"), "{gemini}");
+        assert!(gemini.contains("refuses `--background transparent`"), "{gemini}");
+        let pinned = directive(&[("OPENAI_API_KEY", "sk"), ("GEMINI_API_KEY", "g"), ("IMPECCABLE_IMAGE_PROVIDER", "gemini"), ("IMPECCABLE_GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")]);
+        assert!(pinned.contains("(gemini-3.1-flash-image, billed to the user's Gemini API key;"), "{pinned}");
+        assert!(!gemini.contains('\u{2014}') && !gemini.contains(" -- "), "{gemini}");
     }
 }
 
