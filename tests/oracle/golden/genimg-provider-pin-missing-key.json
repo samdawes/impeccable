@@ -1,0 +1,7 @@
+{
+  "stdout": "",
+  "stderr": "generate-image: IMPECCABLE_IMAGE_PROVIDER is gemini but GEMINI_API_KEY is not set.\n",
+  "exit": 1,
+  "signal": null,
+  "files": {}
+}

@@ -354,6 +354,7 @@ const cases = [
     env: env(), files: IMPECCABLE_FILES,
   },
   { id: 'context-openai-key', verb: 'context', workspace: 'ctx-product-only', env: env({ OPENAI_API_KEY: 'sk-oracle' }), files: IMPECCABLE_FILES },
+  { id: 'context-gemini-key', verb: 'context', workspace: 'ctx-product-only', env: env({ GEMINI_API_KEY: 'gm-oracle' }), files: IMPECCABLE_FILES },
   { id: 'context-no-staleness-check-env', verb: 'context', workspace: 'ctx-legacy', setup: legacySetup, env: env({ IMPECCABLE_NO_STALENESS_CHECK: '1' }), files: IMPECCABLE_FILES },
   {
     id: 'context-no-staleness-check-config', verb: 'context', workspace: 'ctx-legacy',
@@ -831,6 +832,8 @@ const cases = [
   // generate-image writing a declared slot of a recorded hand marks it generated during that hand (one marker file per slot), so a deterministic regeneration with identical bytes still counts; a path no hand declares gets no marker.
   { id: 'genimg-fake-marks-hand-slot', verb: 'generate-image', workspace: 'ctx-empty', setup: (ws) => { fs.mkdirSync(path.join(ws, '.impeccable/mocks/decision'), { recursive: true }); write(ws, '.impeccable/questions/k1.hand.json', JSON.stringify({ digest: '0123456789abcdef', comps: ['.impeccable/mocks/decision/a.png', '.impeccable/mocks/decision/b.png'], pre: {} })); }, args: ['--prompt', 'A decision comp.', '--out', '.impeccable/mocks/decision/a.png', '--size', '64x40'], env: env({ IMPECCABLE_IMAGE_GEN_FAKE: '1' }), files: ['.impeccable/questions/**'] },
   { id: 'genimg-real-no-key', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png'], env: env() },
+  { id: 'genimg-gemini-transparent-refused', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'cutout.png', '--background', 'transparent'], env: env({ GEMINI_API_KEY: 'gm-oracle' }), files: ['cutout.png*'] },
+  { id: 'genimg-provider-pin-missing-key', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png'], env: env({ OPENAI_API_KEY: 'sk-oracle', IMPECCABLE_IMAGE_PROVIDER: 'gemini' }), files: ['x.png*'] },
   // --ref takes a URL too; one that cannot be downloaded names the URL and generates nothing.
   { id: 'genimg-real-ref-url-unreachable', verb: 'generate-image', workspace: 'ctx-empty', args: ['--prompt', 'x', '--out', 'x.png', '--ref', 'http://127.0.0.1:9/cards/world.webp'], env: env({ OPENAI_API_KEY: 'sk-oracle' }), files: ['x.png*'] },
   // Fake mode never fetches a URL ref.

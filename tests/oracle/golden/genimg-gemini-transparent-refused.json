@@ -1,0 +1,7 @@
+{
+  "stdout": "",
+  "stderr": "generate-image: Gemini image models return opaque pixels, so --background transparent cannot be honored; report the transparency blocker, or generate an opaque plate with --background opaque.\n",
+  "exit": 1,
+  "signal": null,
+  "files": {}
+}
